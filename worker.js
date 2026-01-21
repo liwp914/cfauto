@@ -1,10 +1,9 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V7.0 ECH Support)
+ * Cloudflare Worker 多项目部署管理器 (V7.3 DOH Select Support)
  * * 更新日志：
- * 1. [新增] 支持 'ech' 项目部署与管理。
- * 2. [新增] ECH 项目专属 ProxyIP 选择器（内置全球节点列表）。
- * 3. [核心] 部署 ECH 时自动替换代码中的 CF_FALLBACK_IPS 常量。
- * 4. [优化] 账号编辑界面增加 ECH Worker 输入框。
+ * 1. [新增] CMliu DOH 增加 'https://dns.jhb.ovh/joeyblog'。
+ * 2. [优化] DOH 变量输入升级为下拉辅助选择模式 (同 PROXYIP 交互一致)。
+ * 3. [保留] V7.2 的所有功能 (UI自适应, PWA, ECH支持)。
  */
 
 // ==========================================
@@ -15,7 +14,7 @@ const TEMPLATES = {
       name: "CMliu - EdgeTunnel",
       scriptUrl: "https://raw.githubusercontent.com/cmliu/edgetunnel/beta2.0/_worker.js",
       apiUrl: "https://api.github.com/repos/cmliu/edgetunnel/commits/beta2.0",
-      defaultVars: ["UUID", "PROXYIP", "PATH", "URL", "KEY", "ADMIN"],
+      defaultVars: ["UUID", "PROXYIP", "DOH", "PATH", "URL", "KEY", "ADMIN"],
       uuidField: "UUID",
       description: "CMliu (beta2.0)"
     },
@@ -23,7 +22,7 @@ const TEMPLATES = {
       name: "Joey - 少年你相信光吗",
       scriptUrl: "https://raw.githubusercontent.com/byJoey/cfnew/main/%E5%B0%91%E5%B9%B4%E4%BD%A0%E7%9B%B8%E4%BF%A1%E5%85%89%E5%90%97",
       apiUrl: "https://api.github.com/repos/byJoey/cfnew/commits?path=%E5%B0%91%E5%B9%B4%E4%BD%A0%E7%9B%B8%E4%BF%A1%E5%85%89%E5%90%97&per_page=1",
-      defaultVars: ["u", "d"],
+      defaultVars: ["u", "d", "p"],
       uuidField: "u",
       description: "Joey (自动修复)"
     },
@@ -52,6 +51,21 @@ const TEMPLATES = {
       const urlCode = url.searchParams.get("code");
       const cookieHeader = request.headers.get("Cookie") || "";
       
+      // PWA Manifest 路由
+      if (url.pathname === "/manifest.json") {
+          return new Response(JSON.stringify({
+              "name": "Worker 智能中控",
+              "short_name": "Worker中控",
+              "start_url": "/",
+              "display": "standalone",
+              "background_color": "#f3f4f6",
+              "theme_color": "#1e293b",
+              "icons": [
+                  { "src": "https://www.cloudflare.com/img/logo-cloudflare-dark.svg", "sizes": "192x192", "type": "image/svg+xml" }
+              ]
+          }), { headers: { "Content-Type": "application/json" } });
+      }
+
       // 登录验证
       if (correctCode && !cookieHeader.includes(`auth=${correctCode}`) && urlCode !== correctCode) {
         return new Response(loginHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
@@ -427,7 +441,9 @@ const TEMPLATES = {
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Worker 智能中控 (V7.0)</title>
+    <meta name="theme-color" content="#1e293b">
+    <link rel="manifest" href="/manifest.json">
+    <title>Worker 智能中控 (V7.3)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       .input-field { border: 1px solid #cbd5e1; padding: 0.25rem 0.5rem; width:100%; border-radius: 4px; font-size: 0.8rem; } 
@@ -446,12 +462,14 @@ const TEMPLATES = {
     <div class="max-w-7xl mx-auto space-y-4">
       
       <header class="bg-white px-4 py-3 md:px-6 md:py-4 rounded shadow flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
-          <div>
-              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-slate-200 text-slate-600 px-2 py-0.5 rounded ml-2">V7.0</span></h1>
-              <div class="text-[10px] text-gray-400 mt-1">全局管理 · 自动读取 · ECH支持</div>
+          <div class="flex-none">
+              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-slate-200 text-slate-600 px-2 py-0.5 rounded ml-2">V7.3</span></h1>
+              <div class="text-[10px] text-gray-400 mt-1">全局管理 · 自动读取 · ECH/Proxy智能支持</div>
           </div>
+
+          <div id="logs" class="bg-slate-900 text-green-400 p-2 rounded text-xs font-mono hidden max-h-[80px] lg:max-h-[50px] overflow-y-auto shadow-inner w-full lg:flex-1 lg:mx-4 order-2 lg:order-none mb-2 lg:mb-0"></div>
           
-          <div class="flex flex-wrap items-center gap-2 md:gap-3 bg-slate-50 p-2 rounded border border-slate-200 w-full lg:w-auto">
+          <div class="flex flex-wrap items-center gap-2 md:gap-3 bg-slate-50 p-2 rounded border border-slate-200 w-full lg:w-auto flex-none">
                <button onclick="toggleLayout()" class="text-xs bg-white border border-gray-300 text-gray-600 px-2 py-1 rounded hover:bg-gray-50 flex items-center gap-1" id="btn_layout">
                   <span id="layout_icon">◫</span> <span id="layout_text">布局</span>
                </button>
@@ -609,8 +627,6 @@ const TEMPLATES = {
   
         </div>
       </div>
-      
-      <div id="logs" class="bg-slate-900 text-green-400 p-3 rounded text-xs font-mono hidden max-h-40 overflow-y-auto shadow-inner mt-4"></div>
     </div>
   
     <div id="sync_select_modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
@@ -624,10 +640,17 @@ const TEMPLATES = {
   
     <script>
       const TEMPLATES = {
-        'cmliu': { defaultVars: ["UUID", "PROXYIP", "PATH", "URL", "KEY", "ADMIN"], uuidField: "UUID", name: "CMliu - EdgeTunnel" },
-        'joey':  { defaultVars: ["u", "d"], uuidField: "u", name: "Joey - 少年你相信光吗" },
+        'cmliu': { defaultVars: ["UUID", "PROXYIP", "DOH", "PATH", "URL", "KEY", "ADMIN"], uuidField: "UUID", name: "CMliu - EdgeTunnel" },
+        'joey':  { defaultVars: ["u", "d", "p"], uuidField: "u", name: "Joey - 少年你相信光吗" },
         'ech':   { defaultVars: ["PROXYIP"], uuidField: "", name: "ECH - WebSocket Proxy" }
       };
+
+      // DOH 预设列表
+      const DOH_PRESETS = [
+          "https://dns.jhb.ovh/joeyblog",
+          "https://doh.cmliussss.com/CMLiussss",
+          "cloudflare-ech.com"
+      ];
   
       const ECH_PROXIES = [
           {group:"全球 Global", list:["ProxyIP.CMLiussss.net"]},
@@ -671,6 +694,7 @@ const TEMPLATES = {
           checkUpdate('ech');
       }
   
+      // ECH 专属渲染 (保留原逻辑)
       function renderProxySelector() {
           const container = document.getElementById('ech_proxy_selector_container');
           let html = '<select id="ech_proxy_select" onchange="applyEchProxy()" class="w-full text-xs border border-gray-300 rounded p-1 mb-2 bg-white">';
@@ -692,21 +716,19 @@ const TEMPLATES = {
           const val = select.value;
           if (!val) return;
           
-          // 查找或创建 PROXYIP 输入框
           const rows = document.querySelectorAll('.var-row-ech');
           let found = false;
           rows.forEach(r => {
               const k = r.querySelector('.var-key');
               if (k && k.value === 'PROXYIP') {
                   const v = r.querySelector('.var-val');
-                  v.value = val;
+                  v.value = val; // ECH 默认不加端口，保持原样
                   v.classList.add('bg-green-100');
                   setTimeout(() => v.classList.remove('bg-green-100'), 500);
                   found = true;
               }
           });
           
-          // 如果没找到（比如被删了），重新添加
           if (!found) {
               addVarRow('ech', 'PROXYIP', val);
           }
@@ -928,13 +950,11 @@ const TEMPLATES = {
           } catch(e) { alert("❌ 网络错误"); targetBtn.innerHTML = "🗑️"; }
       }
   
-      // 新增：选择同步账号
       function selectSyncAccount(type) {
           const modal = document.getElementById('sync_select_modal');
           const list = document.getElementById('sync_list');
           list.innerHTML = '';
           
-          // 筛选拥有该类型 Worker 的账号
           const validAccounts = accounts.filter(a => a[\`workers_\${type}\`] && a[\`workers_\${type}\`].length > 0);
           
           if (validAccounts.length === 0) {
@@ -973,12 +993,54 @@ const TEMPLATES = {
           } catch(e) { alert('❌ 网络错误'); }
       }
   
-      // ... 下方辅助函数 ...
       async function loadGlobalConfig() { try {const res=await fetch('/api/auto_config');const cfg=await res.json();document.getElementById('auto_update_toggle').checked=!!cfg.enabled;document.getElementById('auto_update_interval').value=cfg.interval||30;document.getElementById('fuse_threshold').value=cfg.fuseThreshold||0;}catch(e){} }
       async function saveAutoConfig() { const enabled=document.getElementById('auto_update_toggle').checked;const interval=parseInt(document.getElementById('auto_update_interval').value);const fuseThreshold=parseInt(document.getElementById('fuse_threshold').value);await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled,interval,unit:'minutes',fuseThreshold})});alert('✅ 全局设置已保存'); }
       async function loadVars(type) { const container=document.getElementById(\`vars_\${type}\`);container.innerHTML='<div class="text-gray-300 text-center py-2">加载中...</div>';try{const res=await fetch(\`/api/settings?type=\${type}\`);const savedVars=await res.json();const defaults=TEMPLATES[type].defaultVars;const uuidKey=TEMPLATES[type].uuidField;const varMap=new Map();if(Array.isArray(savedVars))savedVars.forEach(v=>varMap.set(v.key,v.value));defaults.forEach(k=>{if(!varMap.has(k))varMap.set(k,k===uuidKey?crypto.randomUUID():'');});container.innerHTML='';deletedVars[type]=[];varMap.forEach((v,k)=>{addVarRow(type,k,v);});}catch(e){container.innerHTML='加载失败';} }
       function removeVarRow(btn, type) { const row=btn.parentElement;const keyInput=row.querySelector('.var-key');if(keyInput&&keyInput.value)deletedVars[type].push(keyInput.value);row.remove(); }
-      function addVarRow(type, key='', val='') { const container=document.getElementById(\`vars_\${type}\`);const div=document.createElement('div');div.className=\`flex gap-1 items-center mb-1 var-row-\${type}\`;div.innerHTML=\`<input class="input-field w-1/3 var-key font-bold text-gray-700" placeholder="Key" value="\${key}"><input class="input-field w-2/3 var-val" placeholder="Value" value="\${val}"><button onclick="removeVarRow(this, '\${type}')" class="text-gray-400 hover:text-red-500 px-1 font-bold" title="删除并同步到Worker">×</button>\`;container.appendChild(div); }
+      
+      // [重构] 添加变量行，支持智能辅助输入 (V7.3 Update: DOH Select Support)
+      function addVarRow(type, key='', val='') { 
+          const container = document.getElementById(\`vars_\${type}\`);
+          const div = document.createElement('div');
+          div.className = \`flex gap-1 items-center mb-1 var-row-\${type}\`;
+          
+          let inputExtras = '';
+          let helperHtml = '';
+          
+          // 逻辑 1: DOH 变量添加下拉辅助 (同 PROXYIP)
+          if (type === 'cmliu' && key === 'DOH') {
+             helperHtml = \`
+              <select onchange="this.parentElement.querySelector('.var-val').value = this.value" class="w-6 border border-gray-300 rounded text-xs bg-white text-gray-500 cursor-pointer focus:outline-none focus:border-blue-500" title="快速选择 DOH">
+                  <option value="">▼</option>
+                  \${DOH_PRESETS.map(url => \`<option value="\${url}">\${url}</option>\`).join('')}
+              </select>
+             \`;
+          }
+          
+          // 逻辑 2: Proxy 变量添加快速选择下拉框
+          const isCmliuProxy = (type === 'cmliu' && key === 'PROXYIP');
+          const isJoeyProxy = (type === 'joey' && key === 'p');
+          
+          if (isCmliuProxy || isJoeyProxy) {
+              helperHtml = \`
+              <select onchange="this.parentElement.querySelector('.var-val').value = this.value + ':443'" class="w-6 border border-gray-300 rounded text-xs bg-white text-gray-500 cursor-pointer focus:outline-none focus:border-blue-500" title="快速选择节点">
+                  <option value="">▼</option>
+                  \${ECH_PROXIES.map(g => 
+                      \`<optgroup label="\${g.group}">\${g.list.map(i => \`<option value="\${i.split(' ')[0]}">\${i}</option>\`).join('')}</optgroup>\`
+                  ).join('')}
+              </select>
+              \`;
+          }
+
+          div.innerHTML=\`
+            <input class="input-field w-1/3 var-key font-bold text-gray-700" placeholder="Key" value="\${key}">
+            <input class="input-field w-2/3 var-val" placeholder="Value" value="\${val}" \${inputExtras}>
+            \${helperHtml}
+            <button onclick="removeVarRow(this, '\${type}')" class="text-gray-400 hover:text-red-500 px-1 font-bold" title="删除并同步到Worker">×</button>
+          \`;
+          container.appendChild(div); 
+      }
+
       async function deploy(type) { const btn=document.getElementById(\`btn_deploy_\${type}\`);const originalText=btn.innerText;btn.disabled=true;btn.innerText="⏳ 部署中...";const rows=document.querySelectorAll(\`.var-row-\${type}\`);const variables=[];rows.forEach(r=>{const k=r.querySelector('.var-key').value.trim();const v=r.querySelector('.var-val').value.trim();if(k)variables.push({key:k,value:v});});await fetch(\`/api/settings?type=\${type}\`,{method:'POST',body:JSON.stringify(variables)});const logBox=document.getElementById('logs');logBox.classList.remove('hidden');logBox.innerHTML=\`<div class="text-yellow-400">⚡ 正在部署 \${type} ...</div>\`;try{const res=await fetch(\`/api/deploy?type=\${type}\`,{method:'POST',body:JSON.stringify({variables,deletedVariables:deletedVars[type]})});const logs=await res.json();logBox.innerHTML+=logs.map(l=>\`<div>[\${l.success?'OK':'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`).join('');deletedVars[type]=[];setTimeout(()=>checkUpdate(type),1000);}catch(e){logBox.innerHTML+=\`<div class="text-red-500">❌ 系统错误: \${e.message}</div>\`;}btn.disabled=false;btn.innerText=originalText; }
       async function checkUpdate(type) { const el=document.getElementById(\`ver_\${type}\`);try{const res=await fetch(\`/api/check_update?type=\${type}\`);const d=await res.json();const upstreamTime=d.remote?timeAgo(d.remote.date):"未知";const localTime=d.local?timeAgo(d.local.deployDate):"无记录";const timeInfo=\`<div class="text-[10px] text-gray-500 font-medium mr-2 bg-gray-100 px-2 py-0.5 rounded border border-gray-200 flex items-center gap-2"><span>📦 上游: \${upstreamTime}</span><span class="text-gray-300">|</span><span>🏠 本地: \${localTime}</span></div>\`;if(d.remote&&(!d.local||d.remote.sha!==d.local.sha)){el.innerHTML=\`\${timeInfo}<span class="text-red-500 font-bold animate-pulse">🔴 有更新</span>\`;}else{el.innerHTML=\`\${timeInfo}<span class="text-green-600">✅ 已是最新</span>\`;}}catch(e){el.innerText='状态获取失败';} }
       function refreshUUID(type) { const key=TEMPLATES[type].uuidField;if(!key)return; const rows=document.querySelectorAll(\`.var-row-\${type}\`);rows.forEach(r=>{const k=r.querySelector('.var-key').value;if(k===key){const input=r.querySelector('.var-val');input.value=crypto.randomUUID();input.classList.add('bg-green-100');setTimeout(()=>input.classList.remove('bg-green-100'),500);}}); }
