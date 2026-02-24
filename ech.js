@@ -52,9 +52,17 @@ export default {
                 if (!clientToken) {
                     return new Response('Unauthorized - Token Required', { status: 401 });
                 }
-                const isValid = await verifyWithRemoteJson(TOKEN_JSON_URL, GITHUB_TOKEN, clientToken, env, ctx);
-                if (isValid) {
+                const tokenCfg = await verifyWithRemoteJson(TOKEN_JSON_URL, GITHUB_TOKEN, clientToken, env, ctx);
+                if (tokenCfg) {
                     isAuthorized = true;
+                    // 检查并发设备数限制
+                    const maxDevices = tokenCfg.maxDevices || 0; // 0 = 不限
+                    if (maxDevices > 0 && getActiveCount(clientToken) >= maxDevices) {
+                        return new Response(
+                            'Too Many Devices - Token "' + clientToken + '" already has ' + maxDevices + ' active connection(s)',
+                            { status: 429 }
+                        );
+                    }
                 }
             }
             // 如果没配置任何 Token，默认为免密授权
@@ -66,10 +74,13 @@ export default {
                 return new Response('Unauthorized or Token Expired', { status: 401 });
             }
 
+            // 计数增加 + 注册断开时自动减少
+            if (clientToken) incrementCount(clientToken);
+
             const [client, server] = Object.values(new WebSocketPair());
             server.accept();
 
-            handleSession(server).catch(() => safeCloseWebSocket(server));
+            handleSession(server, clientToken).catch(() => safeCloseWebSocket(server));
 
             // 修复 spread 类型错误
             const responseInit = {
@@ -93,6 +104,18 @@ export default {
 let remoteTokenCache = null;
 let lastCacheTime = 0;
 const CACHE_TTL = 60 * 1000; // 缓存 1 分钟，减少请求
+
+// NOTE: Cloudflare Worker 同一 isolate 内的跨请求活跃连接计数
+// 跨多个 isolate/节点 不共享，提供尽力而为的并发保护
+const activeConnections = new Map(); // token -> currentCount
+
+function getActiveCount(token) { return activeConnections.get(token) || 0; }
+function incrementCount(token) { activeConnections.set(token, getActiveCount(token) + 1); }
+function decrementCount(token) {
+    const c = getActiveCount(token);
+    if (c <= 1) activeConnections.delete(token);
+    else activeConnections.set(token, c - 1);
+}
 
 // 默认内置的元数据格式兜底包
 const fallbackData = {
@@ -156,40 +179,34 @@ async function verifyWithRemoteJson(url, githubToken, clientToken, env, ctx) {
     }
 }
 
-// 提取验证逻辑
+// 提取验证逻辑，返回 tokenConfig 对象 or null (null = 拒绝)
 function checkTokenInConfig(data, token, now) {
-    if (!data) return false;
+    if (!data) return null;
 
     // 为了兼容老版本扁平化数组，提取实际的 Token Array 参数
     let config = data;
     if (typeof data === 'object' && !Array.isArray(data)) {
-        // 如果是新标准的含 tokens 的封装体
         if (data.tokens) {
             config = data.tokens;
         }
     }
 
     // --- 开始鉴权 ---
-
-    // 如果是数组形式 (新旧兼容)
     if (Array.isArray(config)) {
         const row = config.find(item => item.token === token);
-        if (!row) return false;
-        if (row.expire && now > new Date(row.expire).getTime()) {
-            return false;
-        }
-        return true;
+        if (!row) return null;
+        if (row.expire && now > new Date(row.expire).getTime()) return null;
+        // 返回完整的 token 配置（含 maxDevices 等元数据）
+        return row;
     }
-    // 如果是仅包含键值对字典的旧格式兼容
+    // 旧版扁平键值对格式兼容
     else if (typeof config === 'object') {
-        if (!(token in config)) return false;
+        if (!(token in config)) return null;
         const expire = config[token];
-        if (expire && now > new Date(expire).getTime()) {
-            return false;
-        }
-        return true;
+        if (expire && now > new Date(expire).getTime()) return null;
+        return { token, expire };
     }
-    return false;
+    return null;
 }
 
 // 获取配置辅助方法 (外部需要提取开始时间时复用此缓存逻辑但不牵扯具体某个 token)
@@ -299,7 +316,16 @@ function handleAdminPage(pwd) {
         tr:hover { background: #f1f5f9; }
         .actions { display: flex; gap: 10px; }
         
-        .add-row { display: flex; gap: 10px; margin-bottom: 20px; background: #e0f2fe; padding: 15px; border-radius: 6px;}
+        .add-row { display: flex; gap: 10px; margin-bottom: 20px; background: #e0f2fe; padding: 15px; border-radius: 6px; flex-wrap: wrap; align-items: center; }
+        .quick-btns { display: flex; gap: 5px; flex-wrap: wrap; }
+        .quick-btns button { padding: 4px 10px; font-size: 12px; background: #e2e8f0; color: #334155; border: 1px solid #cbd5e1; font-weight: 400; }
+        .quick-btns button:hover { background: #3b82f6; color: white; border-color: #3b82f6; }
+        .days-left { font-size: 13px; font-weight: 600; }
+        .days-left.ok { color: #16a34a; }
+        .days-left.warn { color: #d97706; }
+        .days-left.expired { color: #dc2626; }
+        .days-left.forever { color: #6366f1; }
+        .inline-days-input { width: 60px; padding: 4px 8px; font-size: 12px; }
         #toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 10px 20px; border-radius: 4px; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
     </style>
 </head>
@@ -327,21 +353,32 @@ function handleAdminPage(pwd) {
         </div>
 
         <div class="add-row">
-            <input type="text" id="newToken" placeholder="新 Token (如 a1b2c3d4)" style="flex:1;">
-            <input type="datetime-local" id="newExpire" step="1" title="留空标识永久有效">
-            <button onclick="addToken()">➕ 增加记录</button>
+            <input type="text" id="newToken" placeholder="新 Token (如 a1b2c3d4)" style="flex:1; min-width: 150px;">
+            <div class="quick-btns" id="addQuickBtns">
+                <span style="font-size:12px;color:#64748b;align-self:center;">有效期:</span>
+                <button onclick="setAddExpire(1)">1天</button>
+                <button onclick="setAddExpire(7)">1周</button>
+                <button onclick="setAddExpire(30)">1月</button>
+                <button onclick="setAddExpire(365)">1年</button>
+                <button onclick="setAddExpire(0)">永久</button>
+                <input type="number" id="newExpireDays" class="inline-days-input" placeholder="自定义天数" min="1" onchange="setAddExpireCustom()">
+            </div>
+            <span id="addExpirePreview" style="font-size:12px;color:#64748b;">永久有效</span>
+            <input type="number" id="newMaxDevices" class="inline-days-input" placeholder="设备数(空=不限)" min="1" style="width: 120px;" title="最多多少台设备同时在线，0或空为不限">
+            <button onclick="addToken()">&#xFF0B; 增加记录</button>
         </div>
 
         <table>
             <thead>
                 <tr>
-                    <th style="width: 35%"><div style="display:flex; justify-content: space-between;"><span>Token 凭证标识</span></div></th>
-                    <th style="width: 35%"><div style="display:flex; justify-content: space-between;"><span>过期日 (空=永久)</span></div></th>
-                    <th style="width: 30%">操作</th>
+                    <th style="width: 28%">Token 凭证标识</th>
+                    <th style="width: 20%">有效期状态</th>
+                    <th style="width: 12%">设备上限</th>
+                    <th style="width: 40%">操作</th>
                 </tr>
             </thead>
             <tbody id="tokenList">
-                <tr><td colspan="3" style="text-align: center;">加载中...</td></tr>
+                <tr><td colspan="4" style="text-align: center;">加载中...</td></tr>
             </tbody>
         </table>
     </div>
@@ -398,6 +435,42 @@ function handleAdminPage(pwd) {
             return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().slice(0, 19);
         }
 
+        // 新增区域的到期时间暂存(null代表永久)
+        let addExpireDate = null;
+
+        function setAddExpire(days) {
+            const preview = document.getElementById('addExpirePreview');
+            document.getElementById('newExpireDays').value = '';
+            if (days === 0) {
+                addExpireDate = null;
+                preview.innerText = '永久有效';
+            } else {
+                const d = new Date();
+                d.setDate(d.getDate() + days);
+                addExpireDate = d.toISOString();
+                preview.innerText = '到期: ' + d.toLocaleDateString();
+            }
+        }
+
+        function setAddExpireCustom() {
+            const days = parseInt(document.getElementById('newExpireDays').value);
+            if (!days || days < 1) return;
+            const d = new Date();
+            d.setDate(d.getDate() + days);
+            addExpireDate = d.toISOString();
+            document.getElementById('addExpirePreview').innerText = '到期: ' + d.toLocaleDateString() + ' (' + days + '天后)';
+        }
+
+        function daysLeft(isoStr) {
+            if (!isoStr) return { label: '♾️ 永久', cls: 'forever' };
+            const diff = new Date(isoStr).getTime() - Date.now();
+            const days = Math.floor(diff / 86400000);
+            if (days < 0) return { label: '⛔ 已过期 ' + Math.abs(days) + ' 天', cls: 'expired' };
+            if (days === 0) return { label: '⚠️ 今天到期', cls: 'warn' };
+            if (days <= 7) return { label: '⚠️ 剩 ' + days + ' 天', cls: 'warn' };
+            return { label: '✅ 剩 ' + days + ' 天', cls: 'ok' };
+        }
+
         function renderData() {
             // Render Global
             const st = fullData.global?.SERVER_START_TIME;
@@ -408,24 +481,49 @@ function handleAdminPage(pwd) {
             tbody.innerHTML = '';
             
             if(fullData.tokens.length === 0) {
-               tbody.innerHTML = '<tr><td colspan="3" style="text-align: center;color:#94a3b8">空空如也，请在上方添加</td></tr>';
+               tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;color:#94a3b8">空空如也，请在上方添加</td></tr>';
                return; 
             }
             
             fullData.tokens.forEach((item, index) => {
                 const tr = document.createElement('tr');
                 tr.id = 'row-' + index;
-                const expireText = item.expire ? new Date(item.expire).toLocaleString() : '♾️ 永久有效';
-                const editExpireVal = formatForEdit(item.expire);
-                // NOTE: 使用普通字符串拼接而非模板字面量，规避 TS/JSX 误报
+                const dl = daysLeft(item.expire);
+                const maxD = item.maxDevices || 0;
+                const maxDLabel = maxD > 0 ? maxD + ' 台' : '♾️ 不限';
                 const rowHtml = '' +
                     '<td>' +
                         '<span id="text-token-' + index + '"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;">' + item.token + '</code></span>' +
                         '<input type="text" id="edit-token-' + index + '" value="' + item.token + '" style="display:none; width: 100%;" />' +
                     '</td>' +
                     '<td>' +
-                        '<span id="text-expire-' + index + '">' + expireText + '</span>' +
-                        '<input type="datetime-local" id="edit-expire-' + index + '" value="' + editExpireVal + '" step="1" style="display:none; width: 100%;" />' +
+                        '<span id="text-expire-' + index + '" class="days-left ' + dl.cls + '">' + dl.label + '</span>' +
+                        '<div id="edit-expire-' + index + '" style="display:none;">' +
+                            '<div class="quick-btns" style="margin-bottom:4px;">' +
+                                '<button onclick="applyExpire(' + index + ',1)" style="font-size:11px;">1天</button>' +
+                                '<button onclick="applyExpire(' + index + ',7)" style="font-size:11px;">1周</button>' +
+                                '<button onclick="applyExpire(' + index + ',30)" style="font-size:11px;">1月</button>' +
+                                '<button onclick="applyExpire(' + index + ',365)" style="font-size:11px;">1年</button>' +
+                                '<button onclick="applyExpire(' + index + ',0)" style="font-size:11px;">永久</button>' +
+                            '</div>' +
+                            '<div style="display:flex;gap:4px;align-items:center;">' +
+                                '<input type="number" id="days-input-' + index + '" class="inline-days-input" placeholder="自定天数" min="1" />' +
+                                '<button onclick="applyExpireCustom(' + index + ')" style="font-size:11px;padding:4px 8px;">确定</button>' +
+                            '</div>' +
+                        '</div>' +
+                    '</td>' +
+                    '<td>' +
+                        '<span id="text-maxdev-' + index + '" style="font-size:13px;color:#6366f1;font-weight:600;">' + maxDLabel + '</span>' +
+                        '<div id="edit-maxdev-' + index + '" style="display:none;">' +
+                            '<div class="quick-btns">' +
+                                '<button onclick="setMaxDevices(' + index + ',0)" style="font-size:11px;">不限</button>' +
+                                '<button onclick="setMaxDevices(' + index + ',1)" style="font-size:11px;">1台</button>' +
+                                '<button onclick="setMaxDevices(' + index + ',3)" style="font-size:11px;">3台</button>' +
+                                '<button onclick="setMaxDevices(' + index + ',5)" style="font-size:11px;">5台</button>' +
+                                '<button onclick="setMaxDevices(' + index + ',10)" style="font-size:11px;">10台</button>' +
+                            '</div>' +
+                            '<input type="number" id="maxdev-input-' + index + '" class="inline-days-input" placeholder="自定义" min="0" style="margin-top:4px;" />' +
+                        '</div>' +
                     '</td>' +
                     '<td class="actions">' +
                         '<button id="btn-edit-' + index + '" onclick="startEdit(' + index + ')" style="background:#f59e0b; padding: 4px 10px; font-size: 12px;">✏️ 编辑</button>' +
@@ -442,46 +540,87 @@ function handleAdminPage(pwd) {
             if(!isoString) return '';
             const d = new Date(isoString);
             if(isNaN(d)) return '';
-            // HTML datetime-local 要求 yyyy-MM-ddThh:mm:ss 格式 (不带时区后缀Z)
             return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().slice(0, 19);
         }
 
+        // 编辑区域中暂存各行的到期时间 {idx: isoStr or null}
+        const editExpireMap = {};
+
+        function applyExpire(idx, days) {
+            if (days === 0) {
+                editExpireMap[idx] = null;
+            } else {
+                const d = new Date();
+                d.setDate(d.getDate() + days);
+                editExpireMap[idx] = d.toISOString();
+            }
+        }
+
+        function applyExpireCustom(idx) {
+            const days = parseInt(document.getElementById('days-input-' + idx).value);
+            if (!days || days < 1) { showToast('请输入有效天数', true); return; }
+            const d = new Date();
+            d.setDate(d.getDate() + days);
+            editExpireMap[idx] = d.toISOString();
+            showToast('已设定 ' + days + ' 天后到期');
+        }
+
         function startEdit(idx) {
-            document.getElementById("text-token-" + idx).style.display = 'none';
-            document.getElementById("text-expire-" + idx).style.display = 'none';
-            document.getElementById("edit-token-" + idx).style.display = 'block';
-            document.getElementById("edit-expire-" + idx).style.display = 'block';
-            
-            document.getElementById("btn-edit-" + idx).style.display = 'none';
-            document.getElementById("btn-del-" + idx).style.display = 'none';
-            document.getElementById("btn-save-" + idx).style.display = 'inline-block';
-            document.getElementById("btn-cancel-" + idx).style.display = 'inline-block';
+            // 初始化编辑区暂存为原值
+            editExpireMap[idx] = fullData.tokens[idx].expire || null;
+
+            document.getElementById('text-token-' + idx).style.display = 'none';
+            document.getElementById('text-expire-' + idx).style.display = 'none';
+            document.getElementById('text-maxdev-' + idx).style.display = 'none';
+            document.getElementById('edit-token-' + idx).style.display = 'block';
+            document.getElementById('edit-expire-' + idx).style.display = 'block';
+            document.getElementById('edit-maxdev-' + idx).style.display = 'block';
+            // 预填当前已设定的并发数
+            const curMax = fullData.tokens[idx].maxDevices || 0;
+            document.getElementById('maxdev-input-' + idx).value = curMax > 0 ? curMax : '';
+
+            document.getElementById('btn-edit-' + idx).style.display = 'none';
+            document.getElementById('btn-del-' + idx).style.display = 'none';
+            document.getElementById('btn-save-' + idx).style.display = 'inline-block';
+            document.getElementById('btn-cancel-' + idx).style.display = 'inline-block';
         }
 
         function cancelEdit(idx) {
-            // 取消即重新渲染一次视图即可
+            delete editExpireMap[idx];
             renderData();
         }
 
         function saveEdit(idx) {
-            const newToken = document.getElementById("edit-token-" + idx).value.trim();
-            const newExpire = document.getElementById("edit-expire-" + idx).value;
+            const newToken = document.getElementById('edit-token-' + idx).value.trim();
+            if(!newToken) { showToast('Token不能为空', true); return; }
             
-            if(!newToken) { showToast("Token不能为空", true); return; }
-            
-            // 检查有没有和其他的（非自己这行的）重复
             const duplicate = fullData.tokens.find((x, i) => i !== idx && x.token === newToken);
-            if(duplicate) { showToast("Token 已存在", true); return; }
+            if(duplicate) { showToast('Token 已存在', true); return; }
             
             fullData.tokens[idx].token = newToken;
-            if(newExpire) {
-                fullData.tokens[idx].expire = new Date(newExpire).toISOString();
+            // 读取快捷按钮接管的暂存值
+            if (idx in editExpireMap) {
+                if (editExpireMap[idx]) {
+                    fullData.tokens[idx].expire = editExpireMap[idx];
+                } else {
+                    delete fullData.tokens[idx].expire;
+                }
+                delete editExpireMap[idx];
+            }
+            // 读取 maxDevices
+            const maxDevRaw = parseInt(document.getElementById('maxdev-input-' + idx).value);
+            if (!isNaN(maxDevRaw) && maxDevRaw > 0) {
+                fullData.tokens[idx].maxDevices = maxDevRaw;
             } else {
-                delete fullData.tokens[idx].expire;
+                delete fullData.tokens[idx].maxDevices; // 0 或空 = 不限，删除字段
             }
             
-            showToast("单条记录修改成功");
+            showToast('单条记录修改成功');
             renderData();
+        }
+
+        function setMaxDevices(idx, n) {
+            document.getElementById('maxdev-input-' + idx).value = n > 0 ? n : '';
         }
 
         function setGlobalTime() {
@@ -495,16 +634,20 @@ function handleAdminPage(pwd) {
 
         function addToken() {
             const t = document.getElementById('newToken').value.trim();
-            const e = document.getElementById('newExpire').value;
-            if(!t) { showToast("Token不能为空", true); return; }
-            if(fullData.tokens.find(x => x.token === t)) { showToast("Token 已存在", true); return; }
+            if(!t) { showToast('Token不能为空', true); return; }
+            if(fullData.tokens.find(x => x.token === t)) { showToast('Token 已存在', true); return; }
             
             const newItem = { token: t };
-            if(e) newItem.expire = new Date(e).toISOString();
+            if(addExpireDate) newItem.expire = addExpireDate;
+            const maxD = parseInt(document.getElementById('newMaxDevices').value);
+            if(!isNaN(maxD) && maxD > 0) newItem.maxDevices = maxD;
             
             fullData.tokens.push(newItem);
             document.getElementById('newToken').value = '';
-            document.getElementById('newExpire').value = '';
+            document.getElementById('newExpireDays').value = '';
+            document.getElementById('newMaxDevices').value = '';
+            document.getElementById('addExpirePreview').innerText = '永久有效';
+            addExpireDate = null;
             renderData();
         }
 
@@ -626,7 +769,7 @@ async function handleApiPutTokens(request, targetUrl, githubToken) {
 }
 
 
-async function handleSession(webSocket) {
+async function handleSession(webSocket, sessionToken) {
     let remoteSocket, remoteWriter, remoteReader;
     let isClosed = false;
 
@@ -639,6 +782,8 @@ async function handleSession(webSocket) {
         try { remoteSocket?.close(); } catch { }
 
         remoteWriter = remoteReader = remoteSocket = null;
+        // NOTE: 连接断开时归还设备计数
+        if (sessionToken) decrementCount(sessionToken);
         safeCloseWebSocket(webSocket);
     };
 
