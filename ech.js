@@ -414,25 +414,26 @@ function handleAdminPage(pwd) {
             
             fullData.tokens.forEach((item, index) => {
                 const tr = document.createElement('tr');
-                tr.id = "row-" + index;
-                // 显示模式展示代码
+                tr.id = 'row-' + index;
                 const expireText = item.expire ? new Date(item.expire).toLocaleString() : '♾️ 永久有效';
-                tr.innerHTML = `
-        < td >
-                        <span id="text-token-\${index}"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;">\${item.token}</code></span>
-                        <input type="text" id="edit-token-\${index}" value="\${item.token}" style="display:none; width: 100%;">
-                    </td>
-                    <td>
-                        <span id="text-expire-\${index}">\${expireText}</span>
-                        <input type="datetime-local" id="edit-expire-\${index}" value="\${formatForEdit(item.expire)}" step="1" style="display:none; width: 100%;">
-                    </td>
-                    <td class="actions">
-                        <button id="btn-edit-\${index}" onclick="startEdit(\${index})" style="background:#f59e0b; padding: 4px 10px; font-size: 12px;">✏️ 编辑</button>
-                        <button id="btn-save-\${index}" onclick="saveEdit(\${index})" style="background:#10b981; display:none; padding: 4px 10px; font-size: 12px;">✅ 确认</button>
-                        <button id="btn-cancel-\${index}" class="danger" onclick="cancelEdit(\${index})" style="display:none;"> 取消</button>
-                        <button id="btn-del-\${index}" class="danger" onclick="delToken(\${index})">🗑️ 删除</button>
-                    </td>
-    `;
+                const editExpireVal = formatForEdit(item.expire);
+                // NOTE: 使用普通字符串拼接而非模板字面量，规避 TS/JSX 误报
+                const rowHtml = '' +
+                    '<td>' +
+                        '<span id="text-token-' + index + '"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;">' + item.token + '</code></span>' +
+                        '<input type="text" id="edit-token-' + index + '" value="' + item.token + '" style="display:none; width: 100%;" />' +
+                    '</td>' +
+                    '<td>' +
+                        '<span id="text-expire-' + index + '">' + expireText + '</span>' +
+                        '<input type="datetime-local" id="edit-expire-' + index + '" value="' + editExpireVal + '" step="1" style="display:none; width: 100%;" />' +
+                    '</td>' +
+                    '<td class="actions">' +
+                        '<button id="btn-edit-' + index + '" onclick="startEdit(' + index + ')" style="background:#f59e0b; padding: 4px 10px; font-size: 12px;">✏️ 编辑</button>' +
+                        '<button id="btn-save-' + index + '" onclick="saveEdit(' + index + ')" style="background:#10b981; display:none; padding: 4px 10px; font-size: 12px;">✅ 确认</button>' +
+                        '<button id="btn-cancel-' + index + '" class="danger" onclick="cancelEdit(' + index + ')" style="display:none;"> 取消</button>' +
+                        '<button id="btn-del-' + index + '" class="danger" onclick="delToken(' + index + ')">🗑️ 删除</button>' +
+                    '</td>';
+                tr.innerHTML = rowHtml;
                 tbody.appendChild(tr);
             });
         }
