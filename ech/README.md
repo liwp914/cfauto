@@ -29,6 +29,7 @@
 - 一键推送配置到 GitHub（自动处理 SHA 冲突）
 
 ### 🌍 优选 IP 订阅系统
+- 优选 IP 采集逻辑源自 [CF-Worker-BestIP-collector](https://github.com/ethgan/CF-Worker-BestIP-collector)
 - 从 `zip.cm.edu.kg/all.txt` 拉取全球优选 IP 数据
 - 地区多选面板（全球 100+ 地区，含全选/取消）
 - 每地区数量上限可配置
